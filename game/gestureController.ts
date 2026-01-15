@@ -9,7 +9,6 @@ import {
   type DragPreviewSession,
   type OpenBounds,
   type PathsByColor,
-  type PathsPayload,
 } from './dragTypes';
 
 export type GestureViewport = {
@@ -35,9 +34,6 @@ const cellKeyWorklet = (x: number, y: number) => {
 const ANDROID_PINCH_FOCAL_JUMP = 24;
 const ANDROID_MOVE_SLOP = 3;
 const IOS_MOVE_SLOP = 2;
-const MODE_IDLE = 0;
-const MODE_DRAW = 1;
-const MODE_PAN = 2;
 
 type GestureControllerParams = {
   rows: number;
@@ -51,6 +47,7 @@ type GestureControllerParams = {
   drawActivationDistance: number;
   panLongPressMs: number;
   pinchSnapDuring: boolean;
+  interactionMode: 'draw' | 'pan';
   isDrawing: SharedValue<number>;
   openBounds: OpenBounds;
   openSetByKey: SharedValue<Record<string, true>>;
@@ -66,7 +63,6 @@ type GestureControllerParams = {
   dragColor: SharedValue<string | null>;
   ensureTimerStarted: () => void;
   onDragEnd: () => void;
-  onPathsMutated: (payload: PathsPayload) => void;
   onTap: (cellX: number, cellY: number) => void;
 };
 
@@ -82,6 +78,7 @@ export const useGestureController = ({
   drawActivationDistance,
   panLongPressMs,
   pinchSnapDuring,
+  interactionMode,
   isDrawing,
   openBounds,
   openSetByKey,
@@ -97,7 +94,6 @@ export const useGestureController = ({
   dragColor,
   ensureTimerStarted,
   onDragEnd,
-  onPathsMutated,
   onTap,
 }: GestureControllerParams) => {
   const isAndroid = Platform.OS === 'android';
@@ -117,25 +113,11 @@ export const useGestureController = ({
   const dragSession = useSharedValue<DragPreviewSession | null>(null);
   const drawStartX = useSharedValue(0);
   const drawStartY = useSharedValue(0);
-  const gestureMode = useSharedValue(MODE_IDLE);
   const isPinching = useSharedValue(0);
-  const isPanning = useSharedValue(0);
-  const panStartTranslationX = useSharedValue(0);
-  const panStartTranslationY = useSharedValue(0);
-  const panHoldActive = useSharedValue(0);
   const anchorWorldX = useSharedValue(0);
   const anchorWorldY = useSharedValue(0);
   const pinchFocalX = useSharedValue(0);
   const pinchFocalY = useSharedValue(0);
-
-  const logGesture = useCallback((label: string, data?: Record<string, unknown>) => {
-    if (!__DEV__) return;
-    if (data) {
-      console.log(`[gesture] ${label}`, data);
-      return;
-    }
-    console.log(`[gesture] ${label}`);
-  }, []);
 
   const resetToFit = useCallback(() => {
     if (!viewport.width || !viewport.height) return;
@@ -303,28 +285,6 @@ export const useGestureController = ({
     return { next, removed };
   };
 
-  const serializePaths = (paths: PathsByColor): PathsPayload => {
-    'worklet';
-    const payload: PathsPayload = [];
-    for (const colorKey in paths) {
-      const segments = paths[colorKey] ?? [];
-      const outSegments = [];
-      for (let segIndex = 0; segIndex < segments.length; segIndex += 1) {
-        const segment = segments[segIndex];
-        const cells: number[] = [];
-        for (let cellIndex = 0; cellIndex < segment.cells.length; cellIndex += 1) {
-          const cell = segment.cells[cellIndex];
-          cells.push(cell.x, cell.y);
-        }
-        outSegments.push({ id: segment.id, cells });
-      }
-      if (outSegments.length) {
-        payload.push({ color: colorKey, segments: outSegments });
-      }
-    }
-    return payload;
-  };
-
   const buildPickupPath = (
     segment: { cells: Cell[] },
     index: number,
@@ -472,7 +432,6 @@ export const useGestureController = ({
         pathsShared.value = nextPaths;
         paths = nextPaths;
         pathsMutated.value = 1;
-        runOnJS(onPathsMutated)(serializePaths(paths));
       }
     }
     const segmentHit = findSegmentAt(paths, startCell.x, startCell.y);
@@ -651,9 +610,6 @@ export const useGestureController = ({
           if (hasPinchUpdate.value) {
             const ratio = lastPinchScale.value > 0 ? rawScale / lastPinchScale.value : 1;
             if (ratio < 0.7 || ratio > 1.3) {
-              if (__DEV__ && isAndroid) {
-                runOnJS(logGesture)('pinch scale jump', { rawScale, last: lastPinchScale.value });
-              }
               return;
             }
           }
@@ -741,10 +697,11 @@ export const useGestureController = ({
     ]
   );
 
-  const panDraw = useMemo(() => {
+  const drawPan = useMemo(() => {
     const moveSlopSq = moveSlop * moveSlop;
 
     return Gesture.Pan()
+      .enabled(interactionMode === 'draw')
       .minPointers(1)
       .maxPointers(1)
       .minDistance(0)
@@ -752,10 +709,7 @@ export const useGestureController = ({
         runOnJS(ensureTimerStarted)();
         drawStartX.value = event.x;
         drawStartY.value = event.y;
-        gestureMode.value = MODE_IDLE;
         isDrawing.value = 0;
-        isPanning.value = 0;
-        panHoldActive.value = 0;
         dragSession.value = null;
       })
       .onUpdate((event) => {
@@ -764,39 +718,31 @@ export const useGestureController = ({
         const dy = event.y - drawStartY.value;
         const distSq = dx * dx + dy * dy;
 
-        if (gestureMode.value === MODE_IDLE) {
-          if (panHoldActive.value) {
-            gestureMode.value = MODE_PAN;
-            isPanning.value = 1;
-            panStartTranslationX.value = event.translationX;
-            panStartTranslationY.value = event.translationY;
-          } else if (distSq >= moveSlopSq) {
-            const { cellX, cellY } = toCell(drawStartX.value, drawStartY.value);
-            if (cellX < 0 || cellY < 0 || cellX >= cols || cellY >= rows) {
-              isDrawing.value = 0;
-              clearPreview();
-              return;
-            }
-            const session = startDragSession({ x: cellX, y: cellY });
-            if (!session) {
-              isDrawing.value = 0;
-              clearPreview();
-              return;
-            }
-            gestureMode.value = MODE_DRAW;
-            isDrawing.value = 1;
-            dragSession.value = session;
-            dragColor.value = session.color;
-            previewColor.value = session.color;
-            previewOpacity.value = 1;
-            previewCells.value = flattenPath(session.path);
-            const startTip = cellCenter(session.path[session.path.length - 1], fitCellSize);
-            previewLineTipX.value = startTip.x;
-            previewLineTipY.value = startTip.y;
+        if (!isDrawing.value && distSq >= moveSlopSq) {
+          const { cellX, cellY } = toCell(drawStartX.value, drawStartY.value);
+          if (cellX < 0 || cellY < 0 || cellX >= cols || cellY >= rows) {
+            isDrawing.value = 0;
+            clearPreview();
+            return;
           }
+          const session = startDragSession({ x: cellX, y: cellY });
+          if (!session) {
+            isDrawing.value = 0;
+            clearPreview();
+            return;
+          }
+          isDrawing.value = 1;
+          dragSession.value = session;
+          dragColor.value = session.color;
+          previewColor.value = session.color;
+          previewOpacity.value = 1;
+          previewCells.value = flattenPath(session.path);
+          const startTip = cellCenter(session.path[session.path.length - 1], fitCellSize);
+          previewLineTipX.value = startTip.x;
+          previewLineTipY.value = startTip.y;
         }
 
-        if (gestureMode.value === MODE_DRAW && isDrawing.value) {
+        if (isDrawing.value) {
           const { localX, localY } = toCell(event.x, event.y);
           const session = dragSession.value;
           if (!session) return;
@@ -807,25 +753,12 @@ export const useGestureController = ({
           }
           previewLineTipX.value = result.tip.x;
           previewLineTipY.value = result.tip.y;
-          return;
-        }
-
-        if (gestureMode.value === MODE_PAN && isPanning.value) {
-          if (!isFiniteNumber(pixelRatio) || pixelRatio <= 0) return;
-          const panDx = event.translationX - panStartTranslationX.value;
-          const panDy = event.translationY - panStartTranslationY.value;
-          panX.value = snapToPixel(savedPanX.value + panDx, pixelRatio);
-          panY.value = snapToPixel(savedPanY.value + panDy, pixelRatio);
         }
       })
       .onEnd(() => {
-        if (gestureMode.value === MODE_DRAW && isDrawing.value) {
+        if (isDrawing.value) {
           isDrawing.value = 0;
           runOnJS(onDragEnd)();
-        }
-        if (gestureMode.value === MODE_PAN && isPanning.value) {
-          savedPanX.value = panX.value;
-          savedPanY.value = panY.value;
         }
       })
       .onFinalize(() => {
@@ -833,8 +766,6 @@ export const useGestureController = ({
           isDrawing.value = 0;
           runOnJS(onDragEnd)();
         }
-        isPanning.value = 0;
-        gestureMode.value = MODE_IDLE;
       });
   }, [
     clearPreview,
@@ -845,47 +776,56 @@ export const useGestureController = ({
     drawStartY,
     ensureTimerStarted,
     fitCellSize,
-    gestureMode,
+    interactionMode,
     isDrawing,
     isPinching,
-    isPanning,
     moveSlop,
     onDragEnd,
-    openBounds,
-    openSetByKey,
-    dotColorByKey,
-    pathsShared,
-    panHoldActive,
-    panStartTranslationX,
-    panStartTranslationY,
-    panX,
-    panY,
-    pixelRatio,
     previewCells,
     previewColor,
     previewLineTipX,
     previewLineTipY,
     previewOpacity,
     rows,
-    savedPanX,
-    savedPanY,
     startDragSession,
     toCell,
     updateDragSession,
   ]);
 
-  const panHold = useMemo(
+  const panGesture = useMemo(
     () =>
-      Gesture.LongPress()
-        .minDuration(panLongPressMs)
-        .maxDistance(moveSlop)
-        .onStart(() => {
-          panHoldActive.value = 1;
+      Gesture.Pan()
+        .enabled(interactionMode === 'pan')
+        .minPointers(1)
+        .maxPointers(1)
+        .minDistance(0)
+        .onBegin(() => {
+          runOnJS(ensureTimerStarted)();
+        })
+        .onUpdate((event) => {
+          if (isPinching.value) return;
+          if (!isFiniteNumber(pixelRatio) || pixelRatio <= 0) return;
+          panX.value = snapToPixel(savedPanX.value + event.translationX, pixelRatio);
+          panY.value = snapToPixel(savedPanY.value + event.translationY, pixelRatio);
+        })
+        .onEnd(() => {
+          savedPanX.value = panX.value;
+          savedPanY.value = panY.value;
         })
         .onFinalize(() => {
-          panHoldActive.value = 0;
+          savedPanX.value = panX.value;
+          savedPanY.value = panY.value;
         }),
-    [moveSlop, panHoldActive, panLongPressMs]
+    [
+      ensureTimerStarted,
+      interactionMode,
+      isPinching,
+      panX,
+      panY,
+      pixelRatio,
+      savedPanX,
+      savedPanY,
+    ]
   );
 
   const tap = useMemo(() => {
@@ -894,41 +834,29 @@ export const useGestureController = ({
     return Gesture.Tap()
       .maxDistance(maxDistance)
       .maxDuration(maxDuration)
-      .requireExternalGestureToFail(panDraw)
-      .onBegin((event) => {
-        runOnJS(logGesture)('tap begin', { x: event.x, y: event.y });
-      })
+      .enabled(interactionMode === 'draw')
       .onEnd((event, success) => {
-        runOnJS(logGesture)('tap end', { success, x: event.x, y: event.y });
         if (!success) return;
+        if (interactionMode !== 'draw') return;
         runOnJS(ensureTimerStarted)();
         const { cellX, cellY } = toCell(event.x, event.y);
         if (cellX < 0 || cellY < 0 || cellX >= cols || cellY >= rows) return;
         runOnJS(onTap)(cellX, cellY);
-      })
-      .onFinalize((event, success) => {
-        runOnJS(logGesture)('tap finalize', {
-          success,
-          x: event.x,
-          y: event.y,
-          duration: 'duration' in event ? event.duration : undefined,
-        });
       });
   }, [
     cols,
     drawActivationDistance,
     ensureTimerStarted,
-    logGesture,
     onTap,
-    panDraw,
     panLongPressMs,
     rows,
+    interactionMode,
     toCell,
   ]);
 
   const gesture = useMemo(
-    () => Gesture.Simultaneous(pinch, panDraw, tap, panHold),
-    [panDraw, pinch, tap, panHold]
+    () => Gesture.Simultaneous(pinch, drawPan, panGesture, tap),
+    [drawPan, panGesture, pinch, tap]
   );
 
   return {

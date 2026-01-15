@@ -2,8 +2,16 @@ import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
-import { type ComponentProps, useCallback, useEffect, useState } from 'react';
-import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { type ComponentProps, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Alert,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+  type LayoutRectangle,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Animated, {
   Easing,
@@ -16,14 +24,17 @@ import Animated, {
 
 import levelsData from '@/data/levels.json';
 import { theme } from '@/constants/theme';
-
-type LevelStatus = 'current' | 'locked';
+import {
+  clampLevelId,
+  getCurrentLevelId,
+  resetCurrentLevelId,
+  setCurrentLevelId,
+} from '@/state/sessionProgress';
 
 type Level = {
   id: number;
   rows: number;
   cols: number;
-  status: LevelStatus;
   preview?: boolean;
 };
 
@@ -32,44 +43,48 @@ const AnimatedLinearGradient = Animated.createAnimatedComponent(LinearGradient);
 export default function LobbyScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const drift = useSharedValue(0);
   const railGlow = useSharedValue(0);
   const badgeAnim = useSharedValue(0);
+  const [showGameDebugDot, setShowGameDebugDot] = useState(false);
+  const [currentLevelId, setCurrentLevelIdState] = useState(() => getCurrentLevelId());
+  const scrollRef = useRef<ScrollView>(null);
+  const autoScrollPendingRef = useRef(true);
+  const railLayoutYRef = useRef(0);
+  const contentHeightRef = useRef(0);
+  const scrollHeightRef = useRef(0);
+  const badgeHeightRef = useRef(0);
+  const levelCenterOffsetsRef = useRef<Record<number, number>>({});
+  const [layoutVersion, setLayoutVersion] = useState(0);
 
   useEffect(() => {
-    drift.value = withRepeat(
-      withTiming(1, { duration: 8000, easing: Easing.linear }),
-      -1,
-      false
-    );
     railGlow.value = withRepeat(
       withTiming(1, { duration: 1800, easing: Easing.inOut(Easing.ease) }),
       -1,
       true
     );
     badgeAnim.value = withTiming(1, { duration: 260, easing: Easing.out(Easing.cubic) });
-  }, [badgeAnim, drift, railGlow]);
-  const [levels, setLevels] = useState<Level[]>([]);
-  const unlockAllLevels = useCallback(() => {
-    levelsData.levels.forEach((level) => {
-      level.status = 'current';
-    });
-  }, []);
+  }, [badgeAnim, railGlow]);
+  const orderedLevels = useMemo(
+    () => ([...levelsData.levels].sort((a, b) => b.id - a.id) as Level[]),
+    []
+  );
+  const topLevelId = orderedLevels[0]?.id ?? 1;
+  const maxLevelId = topLevelId;
+  const clampedCurrentLevelId = clampLevelId(currentLevelId, maxLevelId);
+  const currentLevel = orderedLevels.find((level) => level.id === clampedCurrentLevelId);
+  const activeLevelId = currentLevel?.id ?? topLevelId;
 
   useFocusEffect(
     useCallback(() => {
-      unlockAllLevels();
-      setLevels([...levelsData.levels].sort((a, b) => b.id - a.id) as Level[]);
-    }, [unlockAllLevels])
+      autoScrollPendingRef.current = true;
+      const nextId = clampLevelId(getCurrentLevelId(), maxLevelId);
+      const resolvedId =
+        orderedLevels.find((level) => level.id === nextId)?.id ?? topLevelId;
+      setCurrentLevelId(resolvedId);
+      setCurrentLevelIdState(resolvedId);
+      setLayoutVersion((prev) => prev + 1);
+    }, [maxLevelId, orderedLevels, topLevelId])
   );
-
-  const orderedLevels =
-    levels.length > 0
-      ? levels
-      : ([...levelsData.levels].sort((a, b) => b.id - a.id) as Level[]);
-  const currentLevel =
-    orderedLevels.find((level) => level.status === 'current') ?? orderedLevels[0];
-  const topLevelId = orderedLevels[0]?.id ?? 1;
   const headerFadeHeight = theme.sizes.topBarHeight + insets.top + 48;
   const badgeHeight = 64;
   const levelsBottomPad = theme.sizes.tabBarHeight + insets.bottom + badgeHeight + 44;
@@ -82,7 +97,6 @@ export default function LobbyScreen() {
       id: topLevelId + 1,
       rows: 0,
       cols: 0,
-      status: 'locked',
       preview: true,
     },
     ...orderedLevels,
@@ -94,47 +108,104 @@ export default function LobbyScreen() {
     opacity: badgeAnim.value,
     transform: [{ scale: interpolate(badgeAnim.value, [0, 1], [0.9, 1]) }],
   }));
-
-  const refreshLevels = useCallback(() => {
-    setLevels([...levelsData.levels].sort((a, b) => b.id - a.id) as Level[]);
+  const bumpLayout = useCallback(() => {
+    setLayoutVersion((prev) => prev + 1);
   }, []);
+  const handleRailLayout = useCallback(
+    (event: { nativeEvent: { layout: LayoutRectangle } }) => {
+      railLayoutYRef.current = event.nativeEvent.layout.y;
+      bumpLayout();
+    },
+    [bumpLayout]
+  );
+  const handleBadgeLayout = useCallback(
+    (event: { nativeEvent: { layout: LayoutRectangle } }) => {
+      badgeHeightRef.current = event.nativeEvent.layout.height;
+      bumpLayout();
+    },
+    [bumpLayout]
+  );
+  const handleScrollLayout = useCallback(
+    (event: { nativeEvent: { layout: LayoutRectangle } }) => {
+      scrollHeightRef.current = event.nativeEvent.layout.height;
+      bumpLayout();
+    },
+    [bumpLayout]
+  );
+  const handleContentSizeChange = useCallback(
+    (_width: number, height: number) => {
+      contentHeightRef.current = height;
+      bumpLayout();
+    },
+    [bumpLayout]
+  );
+  const handleLevelLayout = useCallback(
+    (levelId: number, layout: LayoutRectangle) => {
+      levelCenterOffsetsRef.current[levelId] = layout.y + theme.sizes.levelNode / 2;
+      bumpLayout();
+    },
+    [bumpLayout]
+  );
+
+  const goToLevel = useCallback(
+    (levelId: number, extraParams?: Record<string, string>) => {
+      const nextId = clampLevelId(levelId, maxLevelId);
+      setCurrentLevelId(nextId);
+      setCurrentLevelIdState(nextId);
+      router.push({
+        pathname: '/game',
+        params: {
+          levelId: String(nextId),
+          showDebugDot: showGameDebugDot ? '1' : '0',
+          ...extraParams,
+        },
+      });
+    },
+    [maxLevelId, router, showGameDebugDot]
+  );
 
   const resetProgress = useCallback(() => {
-    unlockAllLevels();
-    refreshLevels();
-  }, [refreshLevels, unlockAllLevels]);
-
-  const handleUnlockAllLevels = useCallback(() => {
-    unlockAllLevels();
-    refreshLevels();
-  }, [refreshLevels, unlockAllLevels]);
+    resetCurrentLevelId();
+    const nextId = clampLevelId(1, maxLevelId);
+    setCurrentLevelId(nextId);
+    setCurrentLevelIdState(nextId);
+  }, [maxLevelId]);
 
   const showDebugMenu = useCallback(() => {
-    const targetLevelId = currentLevel?.id ?? 1;
+    const targetLevelId = activeLevelId;
     Alert.alert('Debug', undefined, [
       { text: 'Reset Game', onPress: resetProgress },
-      { text: 'Unlock All Levels', onPress: handleUnlockAllLevels },
+      {
+        text: `Game Debug Dot: ${showGameDebugDot ? 'On' : 'Off'}`,
+        onPress: () => setShowGameDebugDot((prev) => !prev),
+      },
       {
         text: 'Level Win',
-        onPress: () => {
-          router.push({
-            pathname: '/game',
-            params: { levelId: String(targetLevelId), debug: 'win' },
-          });
-        },
+        onPress: () => goToLevel(targetLevelId, { debug: 'win' }),
       },
       {
         text: 'Level Fail',
-        onPress: () => {
-          router.push({
-            pathname: '/game',
-            params: { levelId: String(targetLevelId), debug: 'fail' },
-          });
-        },
+        onPress: () => goToLevel(targetLevelId, { debug: 'fail' }),
       },
       { text: 'Cancel', style: 'cancel' },
     ]);
-  }, [currentLevel?.id, handleUnlockAllLevels, resetProgress, router]);
+  }, [activeLevelId, goToLevel, resetProgress, showGameDebugDot]);
+
+  useEffect(() => {
+    if (!autoScrollPendingRef.current) return;
+    const contentHeight = contentHeightRef.current;
+    const scrollHeight = scrollHeightRef.current;
+    const nodeOffset = levelCenterOffsetsRef.current[activeLevelId];
+    if (!contentHeight || !scrollHeight || nodeOffset == null) return;
+    const resolvedBadgeHeight = badgeHeightRef.current || badgeHeight;
+    const anchorY = scrollHeight - resolvedBadgeHeight - 80;
+    if (!Number.isFinite(anchorY)) return;
+    const targetY = railLayoutYRef.current + nodeOffset - anchorY;
+    const maxScroll = Math.max(0, contentHeight - scrollHeight);
+    const clampedY = Math.max(0, Math.min(targetY, maxScroll));
+    scrollRef.current?.scrollTo({ y: clampedY, animated: false });
+    autoScrollPendingRef.current = false;
+  }, [activeLevelId, badgeBottomOffset, badgeHeight, layoutVersion]);
 
   return (
     <LinearGradient
@@ -142,26 +213,37 @@ export default function LobbyScreen() {
       start={{ x: 0.3, y: 0 }}
       end={{ x: 0.8, y: 1 }}
       style={styles.container}>
-      <DotField drift={drift} />
-
       <View style={styles.levelsLayer}>
         <ScrollView
+          ref={scrollRef}
           style={[styles.levelsScroll, { bottom: badgeBottomOffset }]}
           contentContainerStyle={[
             styles.levelsContent,
             { paddingBottom: levelsBottomPad, paddingTop: levelsTopPad },
           ]}
-          showsVerticalScrollIndicator={false}>
-          <View style={styles.levelRail}>
+          showsVerticalScrollIndicator={false}
+          onLayout={handleScrollLayout}
+          onContentSizeChange={handleContentSizeChange}
+          onScrollBeginDrag={() => {
+            autoScrollPendingRef.current = false;
+          }}
+          scrollEventThrottle={16}>
+          <View style={styles.levelRail} onLayout={handleRailLayout}>
             {railLevels.map((level, index) => (
               <View
                 key={level.preview ? `preview-${level.id}` : level.id}
-                style={styles.levelGroup}>
+                style={styles.levelGroup}
+                onLayout={(event) => {
+                  if (!level.preview) {
+                    handleLevelLayout(level.id, event.nativeEvent.layout);
+                  }
+                }}>
                 <LevelNode
                   level={level}
+                  isCurrent={!level.preview && level.id === activeLevelId}
                   onPress={() => {
-                    if (!level.preview && level.status === 'current') {
-                      router.push({ pathname: '/game', params: { levelId: String(level.id) } });
+                    if (!level.preview) {
+                      goToLevel(level.id);
                     }
                   }}
                 />
@@ -189,17 +271,16 @@ export default function LobbyScreen() {
           <Animated.View style={badgeAnimatedStyle}>
             <Pressable
               onPress={() => {
-                if (currentLevel) {
-                  router.push({ pathname: '/game', params: { levelId: String(currentLevel.id) } });
-                }
+                goToLevel(activeLevelId);
               }}
               style={({ pressed }) => [pressed && styles.levelBadgePressed]}>
               <LinearGradient
                 colors={[theme.colors.currentTop, theme.colors.currentBottom]}
                 start={{ x: 0, y: 0 }}
                 end={{ x: 1, y: 1 }}
-                style={styles.levelBadge}>
-                <Text style={styles.levelBadgeText}>Level {currentLevel?.id}</Text>
+                style={styles.levelBadge}
+                onLayout={handleBadgeLayout}>
+                <Text style={styles.levelBadgeText}>Level {activeLevelId}</Text>
               </LinearGradient>
             </Pressable>
           </Animated.View>
@@ -238,51 +319,6 @@ export default function LobbyScreen() {
   );
 }
 
-function DotField({ drift }: { drift: Animated.SharedValue<number> }) {
-  const animatedStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: drift.value * -200 }],
-  }));
-  const animatedOffsetStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: drift.value * -200 + 200 }],
-  }));
-
-  return (
-    <View style={styles.dotField} pointerEvents="none">
-      <Animated.View style={[styles.dotGroup, animatedStyle]}>
-        {dotPositions.map((dot) => (
-          <View
-            key={`a-${dot.key}`}
-            style={[
-              styles.dot,
-              {
-                left: dot.x,
-                top: dot.y,
-                opacity: dot.opacity,
-                transform: [{ scale: dot.scale }],
-              },
-            ]}
-          />
-        ))}
-      </Animated.View>
-      <Animated.View style={[styles.dotGroup, animatedOffsetStyle]}>
-        {dotPositions.map((dot) => (
-          <View
-            key={`b-${dot.key}`}
-            style={[
-              styles.dot,
-              {
-                left: dot.x,
-                top: dot.y,
-                opacity: dot.opacity,
-                transform: [{ scale: dot.scale }],
-              },
-            ]}
-          />
-        ))}
-      </Animated.View>
-    </View>
-  );
-}
 
 function StatPill({
   icon,
@@ -310,14 +346,14 @@ function StatPill({
 
 function LevelNode({
   level,
+  isCurrent,
   onPress,
 }: {
   level: Level;
+  isCurrent: boolean;
   onPress?: () => void;
 }) {
   const isPreview = Boolean(level.preview);
-  const isCurrent = level.status === 'current' && !isPreview;
-  const showLock = !isCurrent;
   const pulse = useSharedValue(0);
 
   useEffect(() => {
@@ -356,7 +392,7 @@ function LevelNode({
 
   return (
     <View style={styles.levelNodeWrap}>
-      {isCurrent ? (
+      {!isPreview && onPress ? (
         <Pressable
           onPress={onPress}
           style={({ pressed }) => [pressed && styles.nodePressed]}>
@@ -365,11 +401,6 @@ function LevelNode({
       ) : (
         <View>{node}</View>
       )}
-      {showLock ? (
-        <View style={[styles.lockBadge, isPreview && styles.lockBadgePreview]}>
-          <MaterialCommunityIcons name="lock" size={18} color="#fff" />
-        </View>
-      ) : null}
     </View>
   );
 }
@@ -377,20 +408,6 @@ function LevelNode({
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-  },
-  dotField: {
-    ...StyleSheet.absoluteFillObject,
-    overflow: 'hidden',
-  },
-  dotGroup: {
-    ...StyleSheet.absoluteFillObject,
-  },
-  dot: {
-    position: 'absolute',
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#7C9BFF',
   },
   levelsLayer: {
     ...StyleSheet.absoluteFillObject,
@@ -549,22 +566,6 @@ const styles = StyleSheet.create({
   levelNumberLocked: {
     color: '#E1E5F2',
   },
-  lockBadge: {
-    position: 'absolute',
-    right: -10,
-    bottom: -6,
-    width: 32,
-    height: 32,
-    borderRadius: 12,
-    backgroundColor: '#F49B2E',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 2,
-    borderColor: '#FDD18B',
-  },
-  lockBadgePreview: {
-    opacity: 0.5,
-  },
   levelBadge: {
     marginTop: 20,
     paddingHorizontal: 32,
@@ -585,51 +586,3 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5,
   },
 });
-
-const dotPositions = [
-  { key: 'd1', x: '12%', y: '18%', opacity: 0.15, scale: 0.7 },
-  { key: 'd2', x: '22%', y: '64%', opacity: 0.12, scale: 0.6 },
-  { key: 'd3', x: '35%', y: '38%', opacity: 0.2, scale: 0.8 },
-  { key: 'd4', x: '46%', y: '78%', opacity: 0.1, scale: 0.5 },
-  { key: 'd5', x: '58%', y: '22%', opacity: 0.16, scale: 0.7 },
-  { key: 'd6', x: '70%', y: '55%', opacity: 0.12, scale: 0.6 },
-  { key: 'd7', x: '82%', y: '32%', opacity: 0.18, scale: 0.9 },
-  { key: 'd8', x: '88%', y: '68%', opacity: 0.1, scale: 0.5 },
-  { key: 'd9', x: '14%', y: '86%', opacity: 0.08, scale: 0.5 },
-  { key: 'd10', x: '64%', y: '10%', opacity: 0.14, scale: 0.6 },
-  { key: 'd11', x: '40%', y: '12%', opacity: 0.12, scale: 0.5 },
-  { key: 'd12', x: '76%', y: '90%', opacity: 0.1, scale: 0.6 },
-  { key: 'd13', x: '6%', y: '28%', opacity: 0.12, scale: 0.6 },
-  { key: 'd14', x: '18%', y: '48%', opacity: 0.1, scale: 0.5 },
-  { key: 'd15', x: '28%', y: '72%', opacity: 0.14, scale: 0.7 },
-  { key: 'd16', x: '32%', y: '90%', opacity: 0.08, scale: 0.5 },
-  { key: 'd17', x: '48%', y: '6%', opacity: 0.12, scale: 0.6 },
-  { key: 'd18', x: '52%', y: '46%', opacity: 0.1, scale: 0.5 },
-  { key: 'd19', x: '56%', y: '84%', opacity: 0.12, scale: 0.6 },
-  { key: 'd20', x: '62%', y: '34%', opacity: 0.15, scale: 0.7 },
-  { key: 'd21', x: '68%', y: '74%', opacity: 0.1, scale: 0.5 },
-  { key: 'd22', x: '74%', y: '16%', opacity: 0.12, scale: 0.6 },
-  { key: 'd23', x: '84%', y: '50%', opacity: 0.1, scale: 0.5 },
-  { key: 'd24', x: '92%', y: '20%', opacity: 0.12, scale: 0.6 },
-  { key: 'd25', x: '94%', y: '82%', opacity: 0.1, scale: 0.5 },
-  { key: 'd26', x: '10%', y: '6%', opacity: 0.12, scale: 0.6 },
-  { key: 'd27', x: '26%', y: '24%', opacity: 0.1, scale: 0.5 },
-  { key: 'd28', x: '36%', y: '56%', opacity: 0.12, scale: 0.6 },
-  { key: 'd29', x: '44%', y: '66%', opacity: 0.1, scale: 0.5 },
-  { key: 'd30', x: '60%', y: '92%', opacity: 0.08, scale: 0.5 },
-  { key: 'd31', x: '78%', y: '8%', opacity: 0.12, scale: 0.6 },
-  { key: 'd32', x: '86%', y: '40%', opacity: 0.1, scale: 0.5 },
-  { key: 'd33', x: '90%', y: '58%', opacity: 0.12, scale: 0.6 },
-  { key: 'd34', x: '96%', y: '38%', opacity: 0.1, scale: 0.5 },
-  { key: 'd35', x: '4%', y: '58%', opacity: 0.12, scale: 0.6 },
-  { key: 'd36', x: '8%', y: '74%', opacity: 0.1, scale: 0.5 },
-  { key: 'd37', x: '20%', y: '8%', opacity: 0.12, scale: 0.6 },
-  { key: 'd38', x: '24%', y: '92%', opacity: 0.08, scale: 0.5 },
-  { key: 'd39', x: '54%', y: '60%', opacity: 0.12, scale: 0.6 },
-  { key: 'd40', x: '66%', y: '26%', opacity: 0.1, scale: 0.5 },
-  { key: 'd41', x: '72%', y: '92%', opacity: 0.08, scale: 0.5 },
-  { key: 'd42', x: '80%', y: '70%', opacity: 0.1, scale: 0.5 },
-  { key: 'd43', x: '86%', y: '12%', opacity: 0.12, scale: 0.6 },
-  { key: 'd44', x: '92%', y: '44%', opacity: 0.1, scale: 0.5 },
-  { key: 'd45', x: '96%', y: '64%', opacity: 0.1, scale: 0.5 },
-];

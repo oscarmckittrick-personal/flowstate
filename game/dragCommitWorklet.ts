@@ -92,6 +92,28 @@ const removeSegmentsWithEndpoints = (source: PathsByColor, keys: Record<string, 
   return removed;
 };
 
+const removeSegmentsAtEndpoint = (source: PathsByColor, endpointKey: string) => {
+  'worklet';
+  let removed = false;
+  for (const color in source) {
+    const segments = source[color];
+    if (!segments || !segments.length) continue;
+    for (let index = segments.length - 1; index >= 0; index -= 1) {
+      const segment = segments[index];
+      if (!segment.cells.length) continue;
+      const first = segment.cells[0];
+      const last = segment.cells[segment.cells.length - 1];
+      const firstKey = cellKey(first.x, first.y);
+      const lastKey = cellKey(last.x, last.y);
+      if (firstKey === endpointKey || lastKey === endpointKey) {
+        removeSegment(source, color, index);
+        removed = true;
+      }
+    }
+  }
+  return removed;
+};
+
 const removeSegmentsWithColorInArea = (
   source: PathsByColor,
   color: string,
@@ -153,8 +175,8 @@ export const commitDragWorklet = (
   let changed = false;
 
   if (isTap) {
-    if (endpointKeys[startKey]) {
-      changed = removeSegmentsWithEndpoints(next, endpointKeys) || changed;
+    if (dotColorByKey[startKey]) {
+      changed = removeSegmentsAtEndpoint(next, startKey) || changed;
     }
     return { paths: changed ? next : paths, didChange: changed, nextSegmentId };
   }

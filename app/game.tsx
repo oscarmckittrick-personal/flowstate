@@ -1,14 +1,5 @@
 import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
-import {
-  Canvas,
-  Circle,
-  Group,
-  Line,
-  Path,
-  Rect,
-  Skia,
-  type SkPath,
-} from '@shopify/react-native-skia';
+import { Canvas, Group, Line, Path, Rect, Skia, type SkPath } from '@shopify/react-native-skia';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -49,6 +40,12 @@ import {
   type PathsPayload,
 } from '@/game/dragTypes';
 import { theme } from '@/constants/theme';
+import {
+  clampLevelId,
+  getCurrentLevelId,
+  resetCurrentLevelId,
+  setCurrentLevelId,
+} from '@/state/sessionProgress';
 
 type OpenCell = {
   x: number;
@@ -173,16 +170,41 @@ const confettiTemplate: ConfettiTemplate[] = [
 ];
 
 export default function GameScreen() {
-  const { levelId, debug } = useLocalSearchParams<{ levelId?: string; debug?: string }>();
+  const { levelId, debug, showDebugDot } = useLocalSearchParams<{
+    levelId?: string;
+    debug?: string;
+    showDebugDot?: string;
+  }>();
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const isAndroid = Platform.OS === 'android';
 
-  const level = useMemo(() => {
+  const maxLevelId = useMemo(() => {
+    if (!levelsData.levels.length) return 1;
+    return levelsData.levels.reduce(
+      (max, item) => (item.id > max ? item.id : max),
+      levelsData.levels[0].id
+    );
+  }, []);
+
+  const resolvedLevelId = useMemo(() => {
     const parsedId = Number(levelId);
-    const target = levelsData.levels.find((item) => item.id === parsedId);
-    return (target ?? levelsData.levels[0]) as Level;
+    if (Number.isFinite(parsedId) && parsedId > 0) {
+      return parsedId;
+    }
+    return getCurrentLevelId();
   }, [levelId]);
+
+  const level = useMemo(() => {
+    const clampedId = clampLevelId(resolvedLevelId, maxLevelId);
+    const target = levelsData.levels.find((item) => item.id === clampedId);
+    return (target ?? levelsData.levels[0]) as Level;
+  }, [maxLevelId, resolvedLevelId]);
+
+  useEffect(() => {
+    const clampedId = clampLevelId(level.id, maxLevelId);
+    setCurrentLevelId(clampedId);
+  }, [level.id, maxLevelId]);
   const gridCells = level.grid;
   const openCells = useMemo(() => {
     if (gridCells?.length) {
@@ -278,9 +300,11 @@ export default function GameScreen() {
   const [isWin, setIsWin] = useState(false);
   const [modal, setModal] = useState<ModalState | null>(null);
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
+  const [timerEnabled, setTimerEnabled] = useState(false);
   const [confettiOn, setConfettiOn] = useState(false);
   const [showDebugOverlay, setShowDebugOverlay] = useState(false);
   const [showDebugMenu, setShowDebugMenu] = useState(false);
+  const [interactionMode, setInteractionMode] = useState<'draw' | 'pan'>('draw');
   const [gestureTuning, setGestureTuning] = useState<GestureTuning>(() => ({
     ...getDefaultGestureTuning(),
   }));
@@ -343,9 +367,9 @@ export default function GameScreen() {
   const pendingTimerSecondsRef = useRef<number | null>(level.timerSeconds ?? null);
   const hasTimerStartedRef = useRef(false);
   const confettiTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const canUndo = history.length > 0;
   const isModalOpen = modal !== null;
   const debugDotTop = insets.top + theme.sizes.topBarHeight + 6;
+  const shouldShowDebugDot = showDebugDot === '1';
   const timerTone =
     timeLeft != null && timeLeft <= 10
       ? 'danger'
@@ -452,9 +476,10 @@ export default function GameScreen() {
   }, []);
 
   const ensureTimerStarted = useCallback(() => {
+    if (!timerEnabled) return;
     if (hasTimerStartedRef.current) return;
     startTimer(pendingTimerSecondsRef.current);
-  }, [startTimer]);
+  }, [startTimer, timerEnabled]);
 
   const pauseTimer = useCallback(() => {
     if (!timerDeadlineRef.current) return;
@@ -484,17 +509,22 @@ export default function GameScreen() {
     previewOpacity,
   ]);
 
+  const handleToggleMode = useCallback(() => {
+    setInteractionMode((prev) => (prev === 'draw' ? 'pan' : 'draw'));
+    clearPreviewLayer();
+  }, [clearPreviewLayer]);
+
   useEffect(() => {
     setPaths({});
     setHistory([]);
     setIsWin(false);
     setModal(null);
     clearPreviewLayer();
-    armTimer(level.timerSeconds ?? null);
-  }, [armTimer, clearPreviewLayer, level.id, level.timerSeconds]);
+    armTimer(timerEnabled ? (level.timerSeconds ?? null) : null);
+  }, [armTimer, clearPreviewLayer, level.id, level.timerSeconds, timerEnabled]);
 
   useEffect(() => {
-    if (isWin || isModalOpen) return;
+    if (!timerEnabled || isWin || isModalOpen) return;
     const tick = () => {
       if (!timerDeadlineRef.current) return;
       const remainingMs = Math.max(0, timerDeadlineRef.current - Date.now());
@@ -510,7 +540,7 @@ export default function GameScreen() {
     tick();
     const id = setInterval(tick, 250);
     return () => clearInterval(id);
-  }, [clearPreviewLayer, isWin, isModalOpen, level.id]);
+  }, [clearPreviewLayer, isWin, isModalOpen, level.id, timerEnabled]);
 
   useEffect(() => {
     if (!isWin) return;
@@ -682,16 +712,6 @@ export default function GameScreen() {
     return next;
   }, []);
 
-  const applyPathsFromPayload = useCallback(
-    (payload: PathsPayload) => {
-      if (!pendingCommitSnapshotRef.current) {
-        pendingCommitSnapshotRef.current = clonePaths(pathsRef.current);
-      }
-      applyPaths(deserializePaths(payload));
-    },
-    [applyPaths, clonePaths, deserializePaths]
-  );
-
   const finalizeCommitFromPayload = useCallback(
     (payload: PathsPayload, didChange: boolean) => {
       if (!didChange) {
@@ -704,24 +724,13 @@ export default function GameScreen() {
     [deserializePaths, finalizeCommit]
   );
 
-  const handleUndo = useCallback(() => {
-    setHistory((prev) => {
-      if (prev.length === 0) return prev;
-      const next = prev.slice(0, -1);
-      const snapshot = prev[prev.length - 1];
-      pathsRef.current = snapshot;
-      setPaths(snapshot);
-      setIsWin(checkWin(snapshot));
+  const handleDebugToggleTimer = useCallback(() => {
+    setTimerEnabled((prev) => {
+      const next = !prev;
+      armTimer(next ? (level.timerSeconds ?? null) : null);
       return next;
     });
-  }, [checkWin]);
-
-  const handleClear = useCallback(() => {
-    applyPaths({});
-    setHistory([]);
-    setIsWin(false);
-    clearPreviewLayer();
-  }, [applyPaths, clearPreviewLayer]);
+  }, [armTimer, level.timerSeconds]);
 
   const resetLevel = useCallback(() => {
     applyPaths({});
@@ -735,14 +744,13 @@ export default function GameScreen() {
       confettiTimeoutRef.current = null;
     }
     clearPreviewLayer();
-    armTimer(level.timerSeconds ?? null);
-  }, [applyPaths, armTimer, clearPreviewLayer, confettiProgress, level.timerSeconds]);
+    armTimer(timerEnabled ? (level.timerSeconds ?? null) : null);
+  }, [applyPaths, armTimer, clearPreviewLayer, confettiProgress, level.timerSeconds, timerEnabled]);
 
   const advanceLevel = useCallback(() => {
-    levelsData.levels.forEach((item: Level) => {
-      item.status = 'current';
-    });
-  }, []);
+    const nextId = clampLevelId(level.id + 1, maxLevelId);
+    setCurrentLevelId(nextId);
+  }, [level.id, maxLevelId]);
 
   const handleCompleteContinue = useCallback(() => {
     advanceLevel();
@@ -769,17 +777,10 @@ export default function GameScreen() {
   }, [router]);
 
   const resetProgress = useCallback(() => {
-    levelsData.levels.forEach((item: Level) => {
-      item.status = 'current';
-    });
+    resetCurrentLevelId();
+    setCurrentLevelId(clampLevelId(1, maxLevelId));
     resetLevel();
-  }, [resetLevel]);
-
-  const unlockAllLevels = useCallback(() => {
-    levelsData.levels.forEach((item: Level) => {
-      item.status = 'current';
-    });
-  }, []);
+  }, [maxLevelId, resetLevel]);
 
   const applyAndroidGesturePreset = useCallback(() => {
     setGestureTuning({
@@ -832,10 +833,6 @@ export default function GameScreen() {
     resetProgress();
     closeDebugMenu();
   }, [closeDebugMenu, resetProgress]);
-  const handleDebugUnlockAll = useCallback(() => {
-    unlockAllLevels();
-    closeDebugMenu();
-  }, [closeDebugMenu, unlockAllLevels]);
   const handleDebugAndroidPreset = useCallback(() => {
     applyAndroidGesturePreset();
     closeDebugMenu();
@@ -1035,6 +1032,7 @@ export default function GameScreen() {
     drawActivationDistance: gestureTuning.drawActivationDistance,
     panLongPressMs: gestureTuning.panLongPressMs,
     pinchSnapDuring: gestureTuning.pinchSnapDuring,
+    interactionMode,
     isDrawing,
     openBounds,
     openSetByKey: openSetShared,
@@ -1050,7 +1048,6 @@ export default function GameScreen() {
     dragColor,
     ensureTimerStarted,
     onDragEnd: stopDrawing,
-    onPathsMutated: applyPathsFromPayload,
     onTap: handleTap,
   });
 
@@ -1087,13 +1084,16 @@ export default function GameScreen() {
       start={{ x: 0.3, y: 0 }}
       end={{ x: 0.8, y: 1 }}
       style={styles.container}>
-      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
+      <View
+        style={[
+          styles.header,
+          { paddingTop: insets.top, height: insets.top + theme.sizes.topBarHeight },
+        ]}>
         <Pressable onPress={() => router.back()} style={styles.backButton}>
           <MaterialCommunityIcons name="chevron-left" size={30} color={theme.colors.textLight} />
         </Pressable>
-        <Text style={styles.headerText}>Level {level.id}</Text>
         <View style={styles.headerActions}>
-          {timeLeft != null ? (
+          {timerEnabled && timeLeft != null ? (
             <View
               style={[
                 styles.timerPill,
@@ -1103,23 +1103,21 @@ export default function GameScreen() {
               <Text style={styles.timerText}>{formatTime(timeLeft)}</Text>
             </View>
           ) : null}
-          <Pressable
-            onPress={handleUndo}
-            disabled={!canUndo}
-            style={[styles.headerAction, !canUndo && styles.headerActionDisabled]}>
-            <MaterialCommunityIcons name="undo-variant" size={20} color={theme.colors.textLight} />
-          </Pressable>
-          <Pressable onPress={handleClear} style={styles.headerAction}>
-            <MaterialCommunityIcons name="trash-can-outline" size={20} color={theme.colors.textLight} />
-          </Pressable>
+        </View>
+        <View
+          pointerEvents="none"
+          style={[styles.headerTitle, { top: insets.top, height: theme.sizes.topBarHeight }]}>
+          <Text style={styles.headerText}>Level {level.id}</Text>
         </View>
       </View>
-      <Pressable
-        onPress={openDebugMenu}
-        hitSlop={12}
-        style={[styles.debugDot, { top: debugDotTop }]}
-      />
-      {showDebugOverlay ? (
+      {shouldShowDebugDot ? (
+        <Pressable
+          onPress={openDebugMenu}
+          hitSlop={12}
+          style={[styles.debugDot, { top: debugDotTop }]}
+        />
+      ) : null}
+      {shouldShowDebugDot && showDebugOverlay ? (
         <View style={[styles.debugPanel, { top: debugDotTop + 14 }]} pointerEvents="auto">
           <Text style={styles.debugTitle}>Debug</Text>
           <Text style={styles.debugText}>
@@ -1194,9 +1192,11 @@ export default function GameScreen() {
               <Text style={styles.debugMenuButtonText}>Reset Game</Text>
             </Pressable>
             <Pressable
-              onPress={handleDebugUnlockAll}
+              onPress={handleDebugToggleTimer}
               style={({ pressed }) => [styles.debugMenuButton, pressed && styles.debugMenuButtonPressed]}>
-              <Text style={styles.debugMenuButtonText}>Unlock All Levels</Text>
+              <Text style={styles.debugMenuButtonText}>
+                Timer: {timerEnabled ? 'On' : 'Off'}
+              </Text>
             </Pressable>
             <Pressable
               onPress={handleDebugAndroidPreset}
@@ -1256,7 +1256,7 @@ export default function GameScreen() {
               transform={gridTransform}
               gridCells={gridCells}
               lineColor="#5B7DFF"
-              backgroundColor="#0F2152"
+              backgroundColor="transparent"
               openCells={openCells}
               dotPoints={dotPoints}
             />
@@ -1295,6 +1295,23 @@ export default function GameScreen() {
             ))}
           </View>
         ) : null}
+      </View>
+      <View style={[styles.toolbar, { paddingBottom: insets.bottom + 18 }]}>
+        <View style={styles.toolbarRow}>
+          <Pressable
+            onPress={handleToggleMode}
+            style={({ pressed }) => [
+              styles.toolbarButton,
+              interactionMode === 'draw' ? styles.toolbarButtonActive : styles.toolbarButtonActivePan,
+              pressed && styles.toolbarButtonPressed,
+            ]}>
+            <MaterialCommunityIcons
+              name={interactionMode === 'draw' ? 'pencil' : 'arrow-all'}
+              size={22}
+              color={theme.colors.textLight}
+            />
+          </Pressable>
+        </View>
       </View>
       {modal ? (
         <Animated.View style={[styles.modalOverlay, modalOverlayStyle]}>
@@ -1419,17 +1436,6 @@ function GridCanvas({
   const dotRadius = cellSize * 0.28;
   const gridStroke = 1 / PIXEL_RATIO;
   const areaStroke = 3 / PIXEL_RATIO;
-  const [dotPulse, setDotPulse] = useState(0);
-  const pulseScale = 1 + dotPulse * 0.08;
-
-  useEffect(() => {
-    const start = Date.now();
-    const id = setInterval(() => {
-      const t = (Date.now() - start) / 1000;
-      setDotPulse((Math.sin(t * 2) + 1) / 2);
-    }, 120);
-    return () => clearInterval(id);
-  }, []);
 
   const cellRects = useMemo(() => {
     if (!openCells?.length) return null;
@@ -1445,16 +1451,32 @@ function GridCanvas({
     });
   }, [dotPoints, cols, rows]);
 
+  const cellStrokePath = useMemo(() => {
+    if (!cellRects?.length) return null;
+    const path = Skia.Path.Make();
+    for (let index = 0; index < cellRects.length; index += 1) {
+      const cell = cellRects[index];
+      path.addRect(Skia.XYWHRect(cell.x * cellSize, cell.y * cellSize, cellSize, cellSize));
+    }
+    return path;
+  }, [cellRects, cellSize]);
 
-  const verticalLines = useMemo(() => {
+  const gridLinesPath = useMemo(() => {
     if (cellRects) return null;
-    return Array.from({ length: cols + 1 }, (_, index) => index * cellSize);
-  }, [cols, cellSize, cellRects]);
+    const path = Skia.Path.Make();
+    for (let index = 0; index <= cols; index += 1) {
+      const x = index * cellSize;
+      path.moveTo(x, 0);
+      path.lineTo(x, height);
+    }
+    for (let index = 0; index <= rows; index += 1) {
+      const y = index * cellSize;
+      path.moveTo(0, y);
+      path.lineTo(width, y);
+    }
+    return path;
+  }, [cellRects, cols, cellSize, height, rows, width]);
 
-  const horizontalLines = useMemo(() => {
-    if (cellRects) return null;
-    return Array.from({ length: rows + 1 }, (_, index) => index * cellSize);
-  }, [rows, cellSize, cellRects]);
 
   const areaLookup = useMemo(() => {
     const map = new Map<string, string>();
@@ -1492,6 +1514,19 @@ function GridCanvas({
       })
       .filter((cell): cell is { x: number; y: number; color: string } => cell !== null);
   }, [areaLookup, gridCells, lineColor]);
+
+  const areaCellPaths = useMemo(() => {
+    if (!areaCells.length) return [];
+    const map = new Map<string, SkPath>();
+    for (let index = 0; index < areaCells.length; index += 1) {
+      const cell = areaCells[index];
+      const key = cell.color;
+      const path = map.get(key) ?? Skia.Path.Make();
+      path.addRect(Skia.XYWHRect(cell.x * cellSize, cell.y * cellSize, cellSize, cellSize));
+      map.set(key, path);
+    }
+    return Array.from(map.entries()).map(([color, path]) => ({ color, path }));
+  }, [areaCells, cellSize]);
 
   const areaBorders = useMemo(() => {
     if (!gridCells?.length || areaIdLookup.size === 0) return [];
@@ -1538,78 +1573,73 @@ function GridCanvas({
     return edges;
   }, [areaIdLookup, areaStroke, cellSize, gridCells, lineColor]);
 
+  const areaBorderPaths = useMemo(() => {
+    if (!areaBorders.length) return [];
+    const map = new Map<string, SkPath>();
+    const half = areaStroke / 2;
+    for (let index = 0; index < areaBorders.length; index += 1) {
+      const edge = areaBorders[index];
+      const key = edge.color;
+      const path = map.get(key) ?? Skia.Path.Make();
+      if (Math.abs(edge.x1 - edge.x2) < 0.001) {
+        const x = edge.x1 - half;
+        const y = Math.min(edge.y1, edge.y2) - half;
+        const height = Math.abs(edge.y2 - edge.y1) + areaStroke;
+        path.addRect(Skia.XYWHRect(x, y, areaStroke, height));
+      } else {
+        const x = Math.min(edge.x1, edge.x2) - half;
+        const y = edge.y1 - half;
+        const width = Math.abs(edge.x2 - edge.x1) + areaStroke;
+        path.addRect(Skia.XYWHRect(x, y, width, areaStroke));
+      }
+      map.set(key, path);
+    }
+    return Array.from(map.entries()).map(([color, path]) => ({ color, path }));
+  }, [areaBorders, areaStroke]);
+
+  const dotPaths = useMemo(() => {
+    if (!visibleDots?.length) return [];
+    const map = new Map<string, SkPath>();
+    for (let index = 0; index < visibleDots.length; index += 1) {
+      const dot = visibleDots[index];
+      const key = dot.color;
+      const path = map.get(key) ?? Skia.Path.Make();
+      path.addCircle(dot.x * cellSize + cellSize / 2, dot.y * cellSize + cellSize / 2, dotRadius);
+      map.set(key, path);
+    }
+    return Array.from(map.entries()).map(([color, path]) => ({ color, path }));
+  }, [dotRadius, visibleDots, cellSize]);
+
   return (
     <Canvas pointerEvents={CANVAS_POINTER_EVENTS} style={{ width: canvasWidth, height: canvasHeight }}>
       <Group transform={transform}>
         <Rect x={0} y={0} width={width} height={height} color={backgroundColor} />
-        {cellRects
-          ? cellRects.map((cell) => (
-              <Rect
-                key={`${cell.x}-${cell.y}`}
-                x={cell.x * cellSize}
-                y={cell.y * cellSize}
-                width={cellSize}
-                height={cellSize}
-                color={lineColor}
-                style="stroke"
-                strokeWidth={gridStroke}
-              />
-            ))
-          : null}
-        {verticalLines
-          ? verticalLines.map((x) => (
-              <Line
-                key={`v-${x}`}
-                p1={{ x, y: 0 }}
-                p2={{ x, y: height }}
-                color={lineColor}
-                strokeWidth={gridStroke}
-              />
-            ))
-          : null}
-        {horizontalLines
-          ? horizontalLines.map((y) => (
-              <Line
-                key={`h-${y}`}
-                p1={{ x: 0, y }}
-                p2={{ x: width, y }}
-                color={lineColor}
-                strokeWidth={gridStroke}
-              />
-            ))
-          : null}
-        {areaCells.map((cell, index) => (
-          <Rect
-            key={`area-stroke-${cell.x}-${cell.y}-${index}`}
-            x={cell.x * cellSize}
-            y={cell.y * cellSize}
-            width={cellSize}
-            height={cellSize}
-            color={withAlpha(cell.color, 0.5)}
+        {cellStrokePath ? (
+          <Path path={cellStrokePath} color={lineColor} style="stroke" strokeWidth={gridStroke} />
+        ) : null}
+        {gridLinesPath ? (
+          <Path path={gridLinesPath} color={lineColor} style="stroke" strokeWidth={gridStroke} />
+        ) : null}
+        {areaCellPaths.map((entry) => (
+          <Path
+            key={`area-stroke-${entry.color}`}
+            path={entry.path}
+            color={withAlpha(entry.color, 0.5)}
             style="stroke"
             strokeWidth={gridStroke}
           />
         ))}
-        {areaBorders.map((edge, index) => (
-          <Line
-            key={`area-border-${index}`}
-            p1={{ x: edge.x1, y: edge.y1 }}
-            p2={{ x: edge.x2, y: edge.y2 }}
-            color={withAlpha(edge.color, 0.85)}
-            strokeWidth={areaStroke}
+        {areaBorderPaths.map((entry) => (
+          <Path
+            key={`area-border-${entry.color}`}
+            path={entry.path}
+            color={withAlpha(entry.color, 0.85)}
+            style="fill"
           />
         ))}
-        {visibleDots
-          ? visibleDots.map((dot, index) => (
-              <Circle
-                key={`${dot.x}-${dot.y}-${index}`}
-                cx={dot.x * cellSize + cellSize / 2}
-                cy={dot.y * cellSize + cellSize / 2}
-                r={dotRadius * pulseScale}
-                color={dot.color}
-              />
-            ))
-          : null}
+        {dotPaths.map((entry) => (
+          <Path key={`dot-${entry.color}`} path={entry.path} color={entry.color} style="fill" />
+        ))}
       </Group>
     </Canvas>
   );
@@ -1917,11 +1947,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: 16,
     justifyContent: 'space-between',
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: 15,
   },
   headerText: {
     fontFamily: theme.fonts.title,
     fontSize: 24,
     color: theme.colors.textLight,
+    textAlign: 'center',
+  },
+  headerTitle: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   headerActions: {
     flexDirection: 'row',
@@ -2060,6 +2103,42 @@ const styles = StyleSheet.create({
     top: 0,
     left: 0,
   },
+  toolbar: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    paddingTop: 12,
+    zIndex: 20,
+    elevation: 20,
+  },
+  toolbarRow: {
+    flexDirection: 'row',
+  },
+  toolbarButton: {
+    width: 56,
+    height: 56,
+    borderRadius: 16,
+    marginHorizontal: 7,
+    backgroundColor: 'rgba(15, 25, 60, 0.7)',
+    borderWidth: 1,
+    borderColor: 'rgba(120, 150, 255, 0.25)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  toolbarButtonActive: {
+    backgroundColor: '#2A4AD6',
+    borderColor: '#6C8CFF',
+  },
+  toolbarButtonActivePan: {
+    backgroundColor: '#1F347A',
+    borderColor: '#5B7DFF',
+  },
+  toolbarButtonPressed: {
+    transform: [{ scale: 0.97 }],
+  },
   timerPill: {
     paddingHorizontal: 10,
     paddingVertical: 6,
@@ -2079,36 +2158,21 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: theme.colors.textLight,
   },
-  headerAction: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#283A86',
-  },
-  headerActionDisabled: {
-    opacity: 0.4,
-  },
   backButton: {
     width: 44,
     height: 44,
     borderRadius: 22,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#283A86',
+    backgroundColor: 'transparent',
   },
   gridViewport: {
     flex: 1,
-    marginHorizontal: 16,
-    marginBottom: 24,
-    borderRadius: 24,
-    overflow: 'hidden',
-    backgroundColor: '#0F2152',
+    marginHorizontal: 0,
+    marginBottom: 0,
   },
   winGlow: {
     ...StyleSheet.absoluteFillObject,
-    borderRadius: 24,
     backgroundColor: '#6AA6FF',
   },
   confettiLayer: {
