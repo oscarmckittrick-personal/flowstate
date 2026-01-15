@@ -1,0 +1,33 @@
+export const theme = {
+  colors: {
+    backgroundTop: '#0C1742',
+    backgroundMid: '#1D2C6A',
+    backgroundBottom: '#23357A',
+    tabBarTop: '#1F2F6D',
+    tabBarBottom: '#182454',
+    tabBarHighlight: '#3C4FD6',
+    cardShadow: '#0C1438',
+    rail: '#5B7DFF',
+    railGlow: '#97B4FF',
+    locked: '#4C546A',
+    lockedDark: '#3B4256',
+    currentTop: '#B2F26B',
+    currentBottom: '#39C97B',
+    coin: '#F0B63A',
+    heart: '#FF5C6C',
+    white: '#FFFFFF',
+    textDark: '#0A153C',
+    textLight: '#F4F7FF',
+  },
+  fonts: {
+    title: 'LilitaOne_400Regular',
+    body: 'Fredoka_400Regular',
+    bodyBold: 'Fredoka_600SemiBold',
+  },
+  sizes: {
+    topBarHeight: 56,
+    tabBarHeight: 76,
+    levelNode: 92,
+    levelRadius: 18,
+  },
+};
