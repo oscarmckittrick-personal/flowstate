@@ -26,7 +26,27 @@ npm run android
 ```
 
 ## Builds
-Production iOS builds are done via EAS:
+Production iOS builds are done via EAS.
+
+### TestFlight flow (recommended)
+We keep the **version** (`app.json` → `expo.version`) manual, and **auto-increment the iOS build number** on every production build. Auto-increment is configured in `eas.json` for the `production` profile.
+
+Use this command to build + auto-submit:
+```bash
+npx eas-cli build -p ios --profile production --auto-submit
+```
+
+If you want to submit later:
+```bash
+npx eas-cli build -p ios --profile production
+npx eas-cli submit -p ios --latest
+```
+
+### Versioning
+- **Build number**: auto-increments on every production build.
+- **Version**: bump manually in `app.json` when you want a new TestFlight/App Store version.
+
+### One-off build
 ```bash
 npx eas-cli build -p ios --profile production
 ```
